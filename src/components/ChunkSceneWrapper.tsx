@@ -14,7 +14,6 @@ export default function ChunkSceneWrapper({ topBarHeight = 32 }: { topBarHeight?
   useEffect(() => {
     if (!containerRef.current) return;
 
-    // we'll assign this after Phaser loads; cleanup uses this function
     let destroyGame: (() => void) | null = null;
 
     (async () => {
@@ -22,19 +21,27 @@ export default function ChunkSceneWrapper({ topBarHeight = 32 }: { topBarHeight?
       const { Scale, Input } = Phaser;
 
       // ---------- CONFIG ----------
-      const TILE = 2;                 // 2px tiles
+      const TILE = 2;
       const VIEW_TILES_W = 240;
       const VIEW_TILES_H = 135;
       const MAP_W = VIEW_TILES_W;
       const MAP_H = VIEW_TILES_H;
 
-      const HERO_FRAME_W = 384;   
-      const HERO_FRAME_H = 1024;  
-      const PLAYER_SCALE  = 0.06;       
-      const MOVE_SPEED = 60;          
-      const CAMERA_ZOOM = 4;          
+      // Your large sheet: 1536x1024 with 4 frames in a row ⇒ 384x1024 per frame
+      const HERO_FRAME_W = 384;
+      const HERO_FRAME_H = 1024;
 
-      // RNG
+      // Movement in world px/sec
+      const MOVE_SPEED = 5;
+
+      // Camera zoom (lowered so sprite size deltas are obvious)
+      const CAMERA_ZOOM = 2.25;
+
+      // Target on-screen sprite height (in world px BEFORE zoom).
+      // Change this number and the sprite WILL change size.
+      const TARGET_HEIGHT_WORLD_PX = 12; // try 8, 12, 16, 24, etc.
+
+      // ---------- RNG ----------
       const seeded = (seed: string) => {
         let h = 2166136261 ^ seed.length;
         for (let i = 0; i < seed.length; i++) { h ^= seed.charCodeAt(i); h += (h<<1)+(h<<4)+(h<<7)+(h<<8)+(h<<24); }
@@ -48,13 +55,13 @@ export default function ChunkSceneWrapper({ topBarHeight = 32 }: { topBarHeight?
         private wasd!: WasdKeys;
 
         preload() {
-          
-       this.load.spritesheet("hero", "/sprites/hero.png", {
-  frameWidth: HERO_FRAME_W,
-  frameHeight: HERO_FRAME_H,
-});
+          // 1) hero sheet (4 frames: back, left, front, right)
+          this.load.spritesheet("hero", "/sprites/hero.png", {
+            frameWidth: HERO_FRAME_W,
+            frameHeight: HERO_FRAME_H,
+          });
 
-          // 2) fallback micro tiles (generated)
+          // 2) micro tiles
           const g = this.add.graphics({ x: 0, y: 0 }).setVisible(false);
           const make = (key: string, draw: (gg: Phaser.GameObjects.Graphics) => void, w = TILE, h = TILE) => {
             g.clear(); draw(g); g.generateTexture(key, w, h);
@@ -73,7 +80,6 @@ export default function ChunkSceneWrapper({ topBarHeight = 32 }: { topBarHeight?
           this.physics.world.setBounds(0, 0, worldW, worldH);
 
           const rand = seeded("mirage_demo_seed");
-
           const tileKeyAt = (x: number, y: number): "water"|"sand"|"rock"|"grass"|"grass2" => {
             const nx = (x - MAP_W / 2) / MAP_W;
             const ny = (y - MAP_H / 2) / MAP_H;
@@ -84,14 +90,12 @@ export default function ChunkSceneWrapper({ topBarHeight = 32 }: { topBarHeight?
             return rand() < 0.15 ? "grass2" : "grass";
           };
 
-          // draw terrain as grid-aligned images
           for (let y = 0; y < MAP_H; y++) {
             for (let x = 0; x < MAP_W; x++) {
               this.add.image(x*TILE, y*TILE, tileKeyAt(x,y)).setOrigin(0);
             }
           }
 
-          // build cliff mask (fake elevation → blockers)
           const cliffMask: boolean[][] = Array.from({ length: MAP_H }, () => Array(MAP_W).fill(false));
           for (let y = 0; y < MAP_H; y++) {
             for (let x = 0; x < MAP_W; x++) {
@@ -109,20 +113,18 @@ export default function ChunkSceneWrapper({ topBarHeight = 32 }: { topBarHeight?
             }
           }
 
-          // colliders: create static images so we get typed StaticBody
-          const cliffBodies: Phaser.Types.Physics.Arcade.ImageWithStaticBody[] = [];
+          const cliffs: Phaser.Types.Physics.Arcade.ImageWithStaticBody[] = [];
           for (let y = 0; y < MAP_H; y++) {
             for (let x = 0; x < MAP_W; x++) {
               if (!cliffMask[y][x]) continue;
               const s = this.physics.add.staticImage(x*TILE + TILE/2, y*TILE + TILE/2, "cliff");
               s.setVisible(false);
               s.body.setSize(TILE, TILE);
-              cliffBodies.push(s);
+              cliffs.push(s);
             }
           }
 
-          // animations (single-frame idle/walk per direction for now)
-          // order: 0 back, 1 left, 2 front, 3 right
+          // --- animations (single frame per direction)
           this.anims.create({ key: "idle-back",  frames: [{ key: "hero", frame: 0 }], frameRate: 1, repeat: -1 });
           this.anims.create({ key: "idle-left",  frames: [{ key: "hero", frame: 1 }], frameRate: 1, repeat: -1 });
           this.anims.create({ key: "idle-front", frames: [{ key: "hero", frame: 2 }], frameRate: 1, repeat: -1 });
@@ -132,25 +134,33 @@ export default function ChunkSceneWrapper({ topBarHeight = 32 }: { topBarHeight?
           this.anims.create({ key: "walk-front", frames: [{ key: "hero", frame: 2 }], frameRate: 6, repeat: -1 });
           this.anims.create({ key: "walk-right", frames: [{ key: "hero", frame: 3 }], frameRate: 6, repeat: -1 });
 
-          // player
+          // --- player spawn
           this.player = this.physics.add
-  .sprite(Math.floor(MAP_W/2)*TILE + TILE/2, Math.floor(MAP_H/2)*TILE + TILE/2, "hero", 2)
-  .setOrigin(0.5)
-  .setScale(PLAYER_SCALE);
-          this.player.body.setSize(8, 8, true);
+            .sprite(Math.floor(MAP_W/2)*TILE + TILE/2, Math.floor(MAP_H/2)*TILE + TILE/2, "hero", 2)
+            .setOrigin(0.5);
+
+          // ✅ Deterministic size:
+          // Option A: compute scale from source frame HEIGHT
+          const scaleFromHeight = TARGET_HEIGHT_WORLD_PX / HERO_FRAME_H;
+          this.player.setScale(scaleFromHeight);
+
+          // Option B (alternative): force exact display size (comment Option A, uncomment B)
+          // this.player.setDisplaySize(TARGET_HEIGHT_WORLD_PX * (HERO_FRAME_W / HERO_FRAME_H), TARGET_HEIGHT_WORLD_PX);
+
+          // Match physics body to a small square footprint (game-feel)
+          this.player.body.setSize(TARGET_HEIGHT_WORLD_PX, TARGET_HEIGHT_WORLD_PX, true);
+
           this.player.setCollideWorldBounds(true);
+          cliffs.forEach(img => this.physics.add.collider(this.player, img));
 
-          // collide with all cliff bodies
-          cliffBodies.forEach(b => this.physics.add.collider(this.player, b));
-
-          // camera
+          // --- camera
           const cam = this.cameras.main;
           cam.setBounds(0, 0, worldW, worldH);
           cam.startFollow(this.player, true, 0.15, 0.15);
           cam.setRoundPixels(true);
           cam.setZoom(CAMERA_ZOOM);
 
-          // input (no any: add keys individually)
+          // --- input
           const kb = this.input.keyboard!;
           this.cursors = kb.createCursorKeys();
           this.wasd = {
@@ -160,16 +170,21 @@ export default function ChunkSceneWrapper({ topBarHeight = 32 }: { topBarHeight?
             D: kb.addKey(Input.Keyboard.KeyCodes.D),
           };
 
-          // hint
-          this.add.text(8, 6, "WASD / Arrows to move", { color: "#ffffff", fontSize: "12px" })
-            .setScrollFactor(0).setDepth(10);
+          // --- debug readout so you can verify size & zoom
+          const dbg = this.add.text(8, 24, "", { color: "#ffffff", fontSize: "12px" })
+            .setScrollFactor(0)
+            .setDepth(10);
+          this.events.on(Phaser.Scenes.Events.UPDATE, () => {
+            dbg.setText(
+              `disp: ${Math.round(this.player.displayWidth)}x${Math.round(this.player.displayHeight)}  ` +
+              `zoom: ${cam.zoom.toFixed(2)}`
+            );
+          });
         }
 
         update() {
-          // movement
           const speed = MOVE_SPEED;
-          let vx = 0;
-          let vy = 0;
+          let vx = 0, vy = 0;
           if (this.cursors.left?.isDown || this.wasd.A.isDown) vx -= 1;
           if (this.cursors.right?.isDown || this.wasd.D.isDown) vx += 1;
           if (this.cursors.up?.isDown || this.wasd.W.isDown) vy -= 1;
@@ -177,7 +192,6 @@ export default function ChunkSceneWrapper({ topBarHeight = 32 }: { topBarHeight?
           if (vx && vy) { vx *= Math.SQRT1_2; vy *= Math.SQRT1_2; }
           this.player.setVelocity(vx * speed, vy * speed);
 
-          // animation by dominant axis
           const moving = vx !== 0 || vy !== 0;
           if (Math.abs(vx) > Math.abs(vy)) {
             if (vx > 0) this.player.anims.play(moving ? "walk-right" : "idle-right", true);
@@ -211,10 +225,7 @@ export default function ChunkSceneWrapper({ topBarHeight = 32 }: { topBarHeight?
       destroyGame = () => game.destroy(true);
     })();
 
-    return () => {
-      if (destroyGame) destroyGame();
-      destroyGame = null;
-    };
+    return () => { if (destroyGame) destroyGame(); destroyGame = null; };
   }, [topBarHeight]);
 
   return (
@@ -224,7 +235,7 @@ export default function ChunkSceneWrapper({ topBarHeight = 32 }: { topBarHeight?
         position: "relative",
         width: "100vw",
         height: `calc(100vh - ${topBarHeight}px)`,
-        marginTop: `${topBarHeight}px`, // space for your header bar
+        marginTop: `${topBarHeight}px`,
         overflow: "hidden",
       }}
     />
